@@ -38,7 +38,7 @@ This will install the `hetzner-k3s` executable in your PATH.
 Alternatively, if you don't want to set up a Ruby runtime but have Docker installed, you can use a container. Run the following from inside the directory where you have the config file for the cluster (described in the next section):
 
 ```bash
-docker run --rm -it -v ${PWD}:/cluster -v ${HOME}/.ssh:/tmp/.ssh vitobotta/hetzner-k3s:v0.3.7 create-cluster --config-file /cluster/test.yaml
+docker run --rm -it -v ${PWD}:/cluster -v ${HOME}/.ssh:/tmp/.ssh vitobotta/hetzner-k3s:v0.4.0 create-cluster --config-file /cluster/test.yaml
 ```
 
 Replace `test.yaml` with the name of your config file.
@@ -54,6 +54,8 @@ cluster_name: test
 kubeconfig_path: "./kubeconfig"
 k3s_version: v1.21.3+k3s1
 ssh_key_path: "~/.ssh/id_rsa.pub"
+ssh_allowed_networks:
+  - 0.0.0.0/0
 verify_host_key: false
 location: nbg1
 masters:
@@ -71,6 +73,11 @@ worker_node_pools:
 It should hopefully be self explanatory; you can run `hetzner-k3s releases` to see a list of the available releases from the most recent to the oldest available.
 
 If you are using Docker, then set `kubeconfig_path` to `/cluster/kubeconfig` so that the kubeconfig is created in the same directory where your config file is.
+
+If you don't want to specify the Hetzner token in the config file (for example if you want to use the tool with CI), then you can use the `HCLOUD_TOKEN` environment variable instead, which has predecence.
+
+**Important**: The tool assignes the label `cluster` to each server it creates, with the clsuter name you specify in the config file, as the value. So please ensure you don't create unrelated servers in the same project having
+the label `cluster=<cluster name>`, because otherwise they will be deleted if you delete the cluster. I recommend you create a separate Hetzner project for each cluster, see note at the end of this README for more details.
 
 
 If you set `masters.instance_count` to 1 then the tool will create a non highly available control plane; for production clusters you may want to set it to a number greater than 1. This number must be odd to avoid split brain issues with etcd and the recommended number is 3.
@@ -225,7 +232,25 @@ The other annotations should be self explanatory. You can find a list of the ava
 Once the cluster is ready you can create persistent volumes out of the box with the default storage class `hcloud-volumes`, since the Hetzner CSI driver is installed automatically. This will use Hetzner's block storage (based on Ceph so it's replicated and highly available) for your persistent volumes. Note that the minimum size of a volume is 10Gi. If you specify a smaller size for a volume, the volume will be created with a capacity of 10Gi anyway.
 
 
+## Keeping a project per cluster
+
+I recommend that you create a separate Hetzner project for each cluster, because otherwise multiple clusters will attempt to create overlapping routes. I will make the pod cidr configurable in the future to avoid this, but I still recommend keeping clusters separated from each other. This way, if you want to delete a cluster with all the resources created for it, you can just delete the project.
+
+
 ## changelog
+
+- 0.4.0
+  - Ensure the masters are removed from the API load balancer before deleting the load balancer
+  - Ensure the servers are removed from the firewall before deleting it
+  - Allow using an environment variable to specify the Hetzner token
+  - Allow restricting SSH access to the nodes to specific networks
+  - Do not open the port 6443 on the nodes if a load balancer is created for an HA cluster
+
+- 0.3.9
+  - Add command "version" to print the version of the tool in use
+
+- 0.3.8
+  - Fix: added a check on a label to ensure that only servers that belong to the cluster are deleted from the project
 
 - 0.3.7
   - Ensure that the cluster name only contains lowercase letters, digits and dashes for compatibility with the cloud controller manager

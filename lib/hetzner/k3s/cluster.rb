@@ -16,12 +16,12 @@ require_relative "../k3s/client_patch"
 
 
 class Cluster
-  def initialize(hetzner_client:)
+  def initialize(hetzner_client:, hetzner_token:)
     @hetzner_client = hetzner_client
+    @hetzner_token = hetzner_token
   end
 
   def create(configuration:)
-    @hetzner_token = configuration.dig("hetzner_token")
     @cluster_name = configuration.dig("cluster_name")
     @kubeconfig_path = File.expand_path(configuration.dig("kubeconfig_path"))
     @ssh_key_path = File.expand_path(configuration.dig("ssh_key_path"))
@@ -31,6 +31,7 @@ class Cluster
     @location = configuration.dig("location")
     @verify_host_key = configuration.fetch("verify_host_key", false)
     @servers = []
+    @networks = configuration.dig("ssh_allowed_networks")
 
     create_resources
 
@@ -69,7 +70,7 @@ class Cluster
                 :masters_config, :worker_node_pools,
                 :location, :ssh_key_path, :kubernetes_client,
                 :hetzner_token, :tls_sans, :new_k3s_version, :configuration,
-                :config_file, :verify_host_key
+                :config_file, :verify_host_key, :networks
 
 
     def latest_k3s_version
@@ -78,10 +79,13 @@ class Cluster
     end
 
     def create_resources
+      master_instance_type = masters_config["instance_type"]
+      masters_count = masters_config["instance_count"]
+
       firewall_id = Hetzner::Firewall.new(
         hetzner_client: hetzner_client,
         cluster_name: cluster_name
-      ).create
+      ).create(ha: (masters_count > 1), networks: networks)
 
       network_id = Hetzner::Network.new(
         hetzner_client: hetzner_client,
@@ -94,9 +98,6 @@ class Cluster
       ).create(ssh_key_path: ssh_key_path)
 
       server_configs = []
-
-      master_instance_type = masters_config["instance_type"]
-      masters_count = masters_config["instance_count"]
 
       masters_count.times do |i|
         server_configs << {
@@ -150,42 +151,15 @@ class Cluster
     end
 
     def delete_resources
-      # Deleting nodes defined according to Kubernetes first
-      begin
-        Timeout::timeout(5) do
-          servers = kubernetes_client.api("v1").resource("nodes").list
-
-          threads = servers.map do |node|
-            Thread.new do
-              Hetzner::Server.new(hetzner_client: hetzner_client, cluster_name: cluster_name).delete(server_name: node.metadata[:name])
-            end
-          end
-
-          threads.each(&:join) unless threads.empty?
-        end
-      rescue Timeout::Error, Excon::Error::Socket
-        puts "Unable to fetch nodes from Kubernetes API. Is the cluster online?"
-      end
-
-      # Deleting nodes defined in the config file just in case there are leftovers i.e. nodes that
-      # were not part of the cluster for some reason
-
-      threads = all_servers.map do |server|
-        Thread.new do
-          Hetzner::Server.new(hetzner_client: hetzner_client, cluster_name: cluster_name).delete(server_name: server["name"])
-        end
-      end
-
-      threads.each(&:join) unless threads.empty?
-
-      puts
-
-      sleep 5 # give time for the servers to actually be deleted
+      Hetzner::LoadBalancer.new(
+        hetzner_client: hetzner_client,
+        cluster_name: cluster_name
+      ).delete(ha: (masters.size > 1))
 
       Hetzner::Firewall.new(
         hetzner_client: hetzner_client,
         cluster_name: cluster_name
-      ).delete
+      ).delete(all_servers)
 
       Hetzner::Network.new(
         hetzner_client: hetzner_client,
@@ -197,11 +171,13 @@ class Cluster
         cluster_name: cluster_name
       ).delete(ssh_key_path: ssh_key_path)
 
-      Hetzner::LoadBalancer.new(
-        hetzner_client: hetzner_client,
-        cluster_name: cluster_name
-      ).delete(ha: (masters.size > 1))
+      threads = all_servers.map do |server|
+        Thread.new do
+          Hetzner::Server.new(hetzner_client: hetzner_client, cluster_name: cluster_name).delete(server_name: server["name"])
+        end
+      end
 
+      threads.each(&:join) unless threads.empty?
     end
 
     def upgrade_cluster
@@ -249,6 +225,7 @@ class Cluster
         --kube-scheduler-arg="bind-address=0.0.0.0" \
         --node-taint CriticalAddonsOnly=true:NoExecute \
         --kubelet-arg="cloud-provider=external" \
+        --advertise-address=$(hostname -I | awk '{print $2}') \
         --node-ip=$(hostname -I | awk '{print $2}') \
         --node-external-ip=$(hostname -I | awk '{print $1}') \
         --flannel-iface=#{flannel_interface} \
@@ -501,7 +478,7 @@ class Cluster
     end
 
     def all_servers
-      @all_servers ||= hetzner_client.get("/servers")["servers"]
+      @all_servers ||= hetzner_client.get("/servers")["servers"].select{ |server| belongs_to_cluster?(server) == true }
     end
 
     def masters
@@ -622,6 +599,10 @@ class Cluster
       File.write(temp_file_path, manifest)
 
       temp_file_path
+    end
+
+    def belongs_to_cluster?(server)
+      server.dig("labels", "cluster") == cluster_name
     end
 
 end

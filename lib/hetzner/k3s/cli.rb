@@ -1,8 +1,11 @@
 require "thor"
 require "http"
 require "sshkey"
+require 'ipaddr'
+require 'open-uri'
 
 require_relative "cluster"
+require_relative "version"
 
 module Hetzner
   module K3s
@@ -11,13 +14,18 @@ module Hetzner
         true
       end
 
+      desc "version", "Print the version"
+      def version
+        puts Hetzner::K3s::VERSION
+      end
+
       desc "create-cluster", "Create a k3s cluster in Hetzner Cloud"
       option :config_file, required: true
 
       def create_cluster
         validate_config_file :create
 
-        Cluster.new(hetzner_client: hetzner_client).create configuration: configuration
+        Cluster.new(hetzner_client: hetzner_client, hetzner_token: find_hetzner_token).create configuration: configuration
       end
 
       desc "delete-cluster", "Delete an existing k3s cluster in Hetzner Cloud"
@@ -25,7 +33,7 @@ module Hetzner
 
       def delete_cluster
         validate_config_file :delete
-        Cluster.new(hetzner_client: hetzner_client).delete configuration: configuration
+        Cluster.new(hetzner_client: hetzner_client, hetzner_token: find_hetzner_token).delete configuration: configuration
       end
 
       desc "upgrade-cluster", "Upgrade an existing k3s cluster in Hetzner Cloud to a new version"
@@ -35,7 +43,7 @@ module Hetzner
 
       def upgrade_cluster
         validate_config_file :upgrade
-        Cluster.new(hetzner_client: hetzner_client).upgrade configuration: configuration, new_k3s_version: options[:new_k3s_version], config_file: options[:config_file]
+        Cluster.new(hetzner_client: hetzner_client, hetzner_token: find_hetzner_token).upgrade configuration: configuration, new_k3s_version: options[:new_k3s_version], config_file: options[:config_file]
       end
 
       desc "releases", "List available k3s releases"
@@ -76,6 +84,7 @@ module Hetzner
           case action
           when :create
             validate_ssh_key
+            validate_ssh_allowed_networks
             validate_location
             validate_k3s_version
             validate_masters
@@ -101,12 +110,26 @@ module Hetzner
           end
         end
 
+        def valid_token?
+          return @valid unless @valid.nil?
+
+          begin
+            token = find_hetzner_token
+            @hetzner_client = Hetzner::Client.new(token: token)
+            response = hetzner_client.get("/locations")
+            error_code = response.dig("error", "code")
+            @valid = if error_code and error_code.size > 0
+              false
+            else
+              true
+            end
+          rescue
+            @valid = false
+          end
+        end
+
         def validate_token
-          token = configuration.dig("hetzner_token")
-          @hetzner_client = Hetzner::Client.new(token: token)
-          hetzner_client.get("/locations")
-        rescue
-          errors << "Invalid Hetzner Cloid token"
+          errors << "Invalid Hetzner Cloud token" unless valid_token?
         end
 
         def validate_cluster_name
@@ -143,6 +166,7 @@ module Hetzner
         end
 
         def server_types
+          return [] unless valid_token?
           @server_types ||= hetzner_client.get("/server_types")["server_types"].map{ |server_type| server_type["name"] }
         rescue
           @errors << "Cannot fetch server types with Hetzner API, please try again later"
@@ -150,13 +174,15 @@ module Hetzner
         end
 
         def locations
+          return [] unless valid_token?
           @locations ||= hetzner_client.get("/locations")["locations"].map{ |location| location["name"] }
         rescue
           @errors << "Cannot fetch locations with Hetzner API, please try again later"
-          false
+          []
         end
 
         def validate_location
+          return if locations.empty? && !valid_token?
           errors << "Invalid location - available locations: nbg1 (Nuremberg, Germany), fsn1 (Falkenstein, Germany), hel1 (Helsinki, Finland)" unless locations.include? configuration.dig("location")
         end
 
@@ -265,7 +291,7 @@ module Hetzner
             instance_group_errors << "#{instance_group_type} is in an invalid format"
           end
 
-          unless server_types.include?(instance_group["instance_type"])
+          unless !valid_token? or server_types.include?(instance_group["instance_type"])
             instance_group_errors << "#{instance_group_type} has an invalid instance type"
           end
 
@@ -290,16 +316,62 @@ module Hetzner
           config_hash = YAML.load_file(File.expand_path(configuration["kubeconfig_path"]))
           config_hash['current-context'] = configuration["cluster_name"]
           @kubernetes_client = K8s::Client.config(K8s::Config.new(config_hash))
-        rescue
           errors << "Cannot connect to the Kubernetes cluster"
           false
         end
-
 
         def validate_verify_host_key
           return unless [true, false].include?(configuration.fetch("ssh_key_path", false))
           errors << "Please set the verify_host_key option to either true or false"
         end
+
+        def find_hetzner_token
+          @token = ENV["HCLOUD_TOKEN"]
+          return @token if @token
+          @token = configuration.dig("hetzner_token")
+        end
+
+        def validate_ssh_allowed_networks
+          networks ||= configuration.dig("ssh_allowed_networks")
+
+          if networks.nil? or networks.empty?
+            errors << "At least one network/IP range must be specified for SSH access"
+            return
+          end
+
+          invalid_networks = networks.reject do |network|
+            IPAddr.new(network) rescue false
+          end
+
+          unless invalid_networks.empty?
+            invalid_networks.each do |network|
+              errors << "The network #{network} is an invalid range"
+            end
+          end
+
+          invalid_ranges = networks.reject do |network|
+            network.include? "/"
+          end
+
+          unless invalid_ranges.empty?
+            invalid_ranges.each do |network|
+              errors << "Please use the CIDR notation for the networks to avoid ambiguity"
+            end
+          end
+
+          return unless invalid_networks.empty?
+
+          current_ip = URI.open('http://whatismyip.akamai.com').read
+
+          current_ip_networks = networks.detect do |network|
+            IPAddr.new(network).include?(current_ip) rescue false
+          end
+
+          unless current_ip_networks
+            errors << "Your current IP #{current_ip} is not included into any of the networks you've specified, so we won't be able to SSH into the nodes"
+          end
+        end
+
     end
   end
 end
